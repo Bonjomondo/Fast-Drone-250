@@ -1,7 +1,24 @@
+/**
+ * @file grid_map.cpp
+ * @brief 3D Occupancy Grid Map implementation for UAV navigation
+ * 
+ * This file implements a probabilistic 3D occupancy grid map that:
+ * - Maintains a volumetric representation of obstacles
+ * - Updates the map using depth camera observations
+ * - Supports ray-casting for occupancy updates
+ * - Provides collision checking for the planner
+ * 
+ * The map uses log-odds representation for efficient probabilistic updates
+ * and supports obstacle inflation for safe navigation.
+ * 
+ * @author FAST-Lab, Zhejiang University
+ */
+
 #include "plan_env/grid_map.h"
 
-// #define current_img_ md_.depth_image_[image_cnt_ & 1]
-// #define last_img_ md_.depth_image_[!(image_cnt_ & 1)]
+// Conversion between probability and log-odds
+// l = log(p / (1-p))
+// p = 1 / (1 + exp(-l))
 
 void GridMap::initMap(ros::NodeHandle &nh)
 {
@@ -184,6 +201,16 @@ void GridMap::resetBuffer(Eigen::Vector3d min_pos, Eigen::Vector3d max_pos)
       }
 }
 
+/**
+ * @brief Update occupancy using raycast cache
+ * 
+ * Updates the log-odds occupancy values for voxels that were
+ * marked during the raycast process.
+ * 
+ * @param pos World position of the observed point
+ * @param occ Occupancy value: 1=occupied, 0=free
+ * @return int Address of the voxel, or INVALID_IDX on error
+ */
 int GridMap::setCacheOccupancy(Eigen::Vector3d pos, int occ)
 {
   if (occ != 1 && occ != 0)
@@ -193,19 +220,34 @@ int GridMap::setCacheOccupancy(Eigen::Vector3d pos, int occ)
   posToIndex(pos, id);
   int idx_ctns = toAddress(id);
 
+  // Increment total observation count
   md_.count_hit_and_miss_[idx_ctns] += 1;
 
+  // Add to cache if first observation this frame
   if (md_.count_hit_and_miss_[idx_ctns] == 1)
   {
     md_.cache_voxel_.push(id);
   }
 
+  // Increment hit count if occupied
   if (occ == 1)
     md_.count_hit_[idx_ctns] += 1;
 
   return idx_ctns;
 }
 
+/**
+ * @brief Project depth image to 3D world coordinates
+ * 
+ * Converts depth pixels to 3D points using camera intrinsic parameters
+ * and the camera-to-world transform. Applies depth filtering if enabled.
+ * 
+ * For each pixel (u, v) with depth d:
+ *   X_camera = (u - cx) * d / fx
+ *   Y_camera = (v - cy) * d / fy
+ *   Z_camera = d
+ *   P_world = R_camera * P_camera + T_camera
+ */
 void GridMap::projectDepthImage()
 {
   // md_.proj_points_.clear();
@@ -330,20 +372,30 @@ void GridMap::projectDepthImage()
   md_.last_depth_image_ = md_.depth_image_;
 }
 
+/**
+ * @brief Process ray-casting for occupancy update
+ * 
+ * For each projected 3D point, casts a ray from the camera center
+ * to the point and updates occupancy values:
+ * - The endpoint (observed point) is marked as occupied
+ * - All voxels along the ray are marked as free
+ * 
+ * Uses Bresenham-style 3D line algorithm for efficient ray traversal.
+ */
 void GridMap::raycastProcess()
 {
-  // if (md_.proj_points_.size() == 0)
+  // Skip if no projected points
   if (md_.proj_points_cnt == 0)
     return;
 
   ros::Time t1, t2;
 
-  md_.raycast_num_ += 1;
+  md_.raycast_num_ += 1;  // Increment raycast iteration counter
 
   int vox_idx;
   double length;
 
-  // bounding box of updated region
+  // Track bounding box of updated region for efficient inflation
   double min_x = mp_.map_max_boundary_(0);
   double min_y = mp_.map_max_boundary_(1);
   double min_z = mp_.map_max_boundary_(2);
@@ -356,12 +408,12 @@ void GridMap::raycastProcess()
   Eigen::Vector3d half = Eigen::Vector3d(0.5, 0.5, 0.5);
   Eigen::Vector3d ray_pt, pt_w;
 
+  // Process each projected point
   for (int i = 0; i < md_.proj_points_cnt; ++i)
   {
     pt_w = md_.proj_points_[i];
 
-    // set flag for projected point
-
+    // Handle points outside map boundary
     if (!isInMap(pt_w))
     {
       pt_w = closetPointInMap(pt_w, md_.camera_pos_);
@@ -371,7 +423,7 @@ void GridMap::raycastProcess()
       {
         pt_w = (pt_w - md_.camera_pos_) / length * mp_.max_ray_length_ + md_.camera_pos_;
       }
-      vox_idx = setCacheOccupancy(pt_w, 0);
+      vox_idx = setCacheOccupancy(pt_w, 0);  // Mark as free (no obstacle detected)
     }
     else
     {
@@ -379,15 +431,18 @@ void GridMap::raycastProcess()
 
       if (length > mp_.max_ray_length_)
       {
+        // Point too far - treat as max range reading (free space)
         pt_w = (pt_w - md_.camera_pos_) / length * mp_.max_ray_length_ + md_.camera_pos_;
         vox_idx = setCacheOccupancy(pt_w, 0);
       }
       else
       {
+        // Valid obstacle detection - mark as occupied
         vox_idx = setCacheOccupancy(pt_w, 1);
       }
     }
 
+    // Update bounding box
     max_x = max(max_x, pt_w(0));
     max_y = max(max_y, pt_w(1));
     max_z = max(max_z, pt_w(2));
@@ -396,10 +451,10 @@ void GridMap::raycastProcess()
     min_y = min(min_y, pt_w(1));
     min_z = min(min_z, pt_w(2));
 
-    // raycasting between camera center and point
-
+    // Raycast from camera center to point - mark traversed voxels as free
     if (vox_idx != INVALID_IDX)
     {
+      // Skip if this endpoint was already processed this iteration
       if (md_.flag_rayend_[vox_idx] == md_.raycast_num_)
       {
         continue;
