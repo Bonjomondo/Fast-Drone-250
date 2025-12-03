@@ -1,29 +1,49 @@
+/**
+ * @file ego_replan_fsm.cpp
+ * @brief Finite State Machine for Ego-Planner trajectory replanning
+ * 
+ * This file implements the core FSM logic for managing the planning states
+ * and coordinating trajectory generation, execution, and replanning.
+ * 
+ * @author FAST-Lab, Zhejiang University
+ */
 
 #include <plan_manage/ego_replan_fsm.h>
 
 namespace ego_planner
 {
 
+  /**
+   * @brief Initialize the Ego-Planner FSM
+   * 
+   * Sets up all parameters, subscribers, publishers, timers, and initializes
+   * the planner manager and visualization modules.
+   * 
+   * @param nh ROS node handle for parameter access and topic communication
+   */
   void EGOReplanFSM::init(ros::NodeHandle &nh)
   {
+    // Initialize state variables
     current_wp_ = 0;
     exec_state_ = FSM_EXEC_STATE::INIT;
     have_target_ = false;
     have_odom_ = false;
     have_recv_pre_agent_ = false;
 
-    /*  fsm param  */
-    nh.param("fsm/flight_type", target_type_, -1);
-    nh.param("fsm/thresh_replan_time", replan_thresh_, -1.0);
-    nh.param("fsm/thresh_no_replan_meter", no_replan_thresh_, -1.0);
-    nh.param("fsm/planning_horizon", planning_horizen_, -1.0);
+    /*  Load FSM parameters from ROS parameter server */
+    nh.param("fsm/flight_type", target_type_, -1);              // 1: manual target, 2: preset waypoints
+    nh.param("fsm/thresh_replan_time", replan_thresh_, -1.0);   // Time threshold to trigger replanning
+    nh.param("fsm/thresh_no_replan_meter", no_replan_thresh_, -1.0);  // Distance threshold for no-replan zone
+    nh.param("fsm/planning_horizon", planning_horizen_, -1.0);   // Look-ahead planning distance
     nh.param("fsm/planning_horizen_time", planning_horizen_time_, -1.0);
-    nh.param("fsm/emergency_time", emergency_time_, 1.0);
+    nh.param("fsm/emergency_time", emergency_time_, 1.0);        // Time buffer for emergency stop
     nh.param("fsm/realworld_experiment", flag_realworld_experiment_, false);
     nh.param("fsm/fail_safe", enable_fail_safe_, true);
 
+    // In simulation, trigger is automatic; in real experiments, wait for manual trigger
     have_trigger_ = !flag_realworld_experiment_;
 
+    // Load preset waypoints if using preset target mode
     nh.param("fsm/waypoint_num", waypoint_num_, -1);
     for (int i = 0; i < waypoint_num_; i++)
     {
@@ -32,17 +52,20 @@ namespace ego_planner
       nh.param("fsm/waypoint" + to_string(i) + "_z", waypoints_[i][2], -1.0);
     }
 
-    /* initialize main modules */
+    /* Initialize main planning modules */
     visualization_.reset(new PlanningVisualization(nh));
     planner_manager_.reset(new EGOPlannerManager);
     planner_manager_->initPlanModules(nh, visualization_);
-    planner_manager_->deliverTrajToOptimizer(); // store trajectories
+    planner_manager_->deliverTrajToOptimizer(); // Store trajectories for optimization
     planner_manager_->setDroneIdtoOpt();
 
-    /* callback */
+    /* Set up callback timers */
+    // Main FSM execution callback at 100Hz
     exec_timer_ = nh.createTimer(ros::Duration(0.01), &EGOReplanFSM::execFSMCallback, this);
+    // Safety check callback at 20Hz
     safety_timer_ = nh.createTimer(ros::Duration(0.05), &EGOReplanFSM::checkCollisionCallback, this);
 
+    // Subscribe to odometry data
     odom_sub_ = nh.subscribe("odom_world", 1, &EGOReplanFSM::odometryCallback, this);
 
     if (planner_manager_->pp_.drone_id >= 1)
@@ -428,10 +451,28 @@ namespace ego_planner
     cout << "[FSM]: state: " + state_str[int(exec_state_)] << endl;
   }
 
+  /**
+   * @brief Main FSM execution callback
+   * 
+   * This is the core state machine that manages the planning process.
+   * Called at 100Hz, it handles state transitions and triggers appropriate
+   * planning actions based on the current state.
+   * 
+   * State Transitions:
+   * - INIT: Wait for odometry, then -> WAIT_TARGET
+   * - WAIT_TARGET: Wait for goal, then -> SEQUENTIAL_START (for swarm) or GEN_NEW_TRAJ
+   * - GEN_NEW_TRAJ: Generate new trajectory -> EXEC_TRAJ on success
+   * - EXEC_TRAJ: Execute trajectory, -> REPLAN_TRAJ if needed
+   * - REPLAN_TRAJ: Replan from current state -> EXEC_TRAJ on success
+   * - EMERGENCY_STOP: Stop and hover, optionally retry planning
+   * 
+   * @param e Timer event (unused)
+   */
   void EGOReplanFSM::execFSMCallback(const ros::TimerEvent &e)
   {
-    exec_timer_.stop(); // To avoid blockage
+    exec_timer_.stop(); // Prevent blocking from timer overlap
 
+    // Periodic status printing (every 1 second)
     static int fsm_num = 0;
     fsm_num++;
     if (fsm_num == 100)
@@ -444,14 +485,15 @@ namespace ego_planner
       fsm_num = 0;
     }
 
+    // Main state machine switch
     switch (exec_state_)
     {
     case INIT:
     {
+      // Wait until odometry is available
       if (!have_odom_)
       {
         goto force_return;
-        // return;
       }
       changeFSMExecState(WAIT_TARGET, "FSM");
       break;
@@ -459,36 +501,29 @@ namespace ego_planner
 
     case WAIT_TARGET:
     {
+      // Wait for target point and trigger signal
       if (!have_target_ || !have_trigger_)
         goto force_return;
-      // return;
       else
       {
-        // if ( planner_manager_->pp_.drone_id <= 0 )
-        // {
-        //   changeFSMExecState(GEN_NEW_TRAJ, "FSM");
-        // }
-        // else
-        // {
         changeFSMExecState(SEQUENTIAL_START, "FSM");
-        // }
       }
       break;
     }
 
-    case SEQUENTIAL_START: // for swarm
+    case SEQUENTIAL_START: // For swarm coordination - sequential takeoff
     {
-      // cout << "id=" << planner_manager_->pp_.drone_id << " have_recv_pre_agent_=" << have_recv_pre_agent_ << endl;
+      // Check if previous drone in sequence has started
       if (planner_manager_->pp_.drone_id <= 0 || (planner_manager_->pp_.drone_id >= 1 && have_recv_pre_agent_))
       {
         if (have_odom_ && have_target_ && have_trigger_)
         {
-          bool success = planFromGlobalTraj(10); // zx-todo
+          // Attempt to generate first trajectory
+          bool success = planFromGlobalTraj(10);
           if (success)
           {
             changeFSMExecState(EXEC_TRAJ, "FSM");
-
-            publishSwarmTrajs(true);
+            publishSwarmTrajs(true);  // Broadcast to other drones
           }
           else
           {
@@ -501,18 +536,13 @@ namespace ego_planner
           ROS_ERROR("No odom or no target! have_odom_=%d, have_target_=%d", have_odom_, have_target_);
         }
       }
-
       break;
     }
 
     case GEN_NEW_TRAJ:
     {
-
-      // Eigen::Vector3d rot_x = odom_orient_.toRotationMatrix().block(0, 0, 3, 1);
-      // start_yaw_(0)         = atan2(rot_x(1), rot_x(0));
-      // start_yaw_(1) = start_yaw_(2) = 0.0;
-
-      bool success = planFromGlobalTraj(10); // zx-todo
+      // Generate a new trajectory from scratch
+      bool success = planFromGlobalTraj(10);
       if (success)
       {
         changeFSMExecState(EXEC_TRAJ, "FSM");
@@ -521,14 +551,14 @@ namespace ego_planner
       }
       else
       {
-        changeFSMExecState(GEN_NEW_TRAJ, "FSM");
+        changeFSMExecState(GEN_NEW_TRAJ, "FSM");  // Retry
       }
       break;
     }
 
     case REPLAN_TRAJ:
     {
-
+      // Replan from current trajectory state
       if (planFromCurrentTraj(1))
       {
         changeFSMExecState(EXEC_TRAJ, "FSM");
@@ -536,15 +566,14 @@ namespace ego_planner
       }
       else
       {
-        changeFSMExecState(REPLAN_TRAJ, "FSM");
+        changeFSMExecState(REPLAN_TRAJ, "FSM");  // Retry
       }
-
       break;
     }
 
     case EXEC_TRAJ:
     {
-      /* determine if need to replan */
+      /* Check if replanning is needed during trajectory execution */
       LocalTrajData *info = &planner_manager_->local_data_;
       ros::Time time_now = ros::Time::now();
       double t_cur = (time_now - info->start_time_).toSec();
@@ -552,7 +581,7 @@ namespace ego_planner
 
       Eigen::Vector3d pos = info->position_traj_.evaluateDeBoorT(t_cur);
 
-      /* && (end_pt_ - pos).norm() < 0.5 */
+      // Check if current waypoint is reached (for preset waypoint mode)
       if ((target_type_ == TARGET_TYPE::PRESET_TARGET) &&
           (wp_id_ < waypoint_num_ - 1) &&
           (end_pt_ - pos).norm() < no_replan_thresh_)
@@ -560,59 +589,62 @@ namespace ego_planner
         wp_id_++;
         planNextWaypoint(wps_[wp_id_]);
       }
-      else if ((local_target_pt_ - end_pt_).norm() < 1e-3) // close to the global target
+      // Check if close to final goal
+      else if ((local_target_pt_ - end_pt_).norm() < 1e-3)
       {
         if (t_cur > info->duration_ - 1e-2)
         {
+          // Trajectory completed
           have_target_ = false;
           have_trigger_ = false;
 
           if (target_type_ == TARGET_TYPE::PRESET_TARGET)
           {
+            // Loop waypoints
             wp_id_ = 0;
             planNextWaypoint(wps_[wp_id_]);
           }
 
           changeFSMExecState(WAIT_TARGET, "FSM");
           goto force_return;
-          // return;
         }
         else if ((end_pt_ - pos).norm() > no_replan_thresh_ && t_cur > replan_thresh_)
         {
           changeFSMExecState(REPLAN_TRAJ, "FSM");
         }
       }
+      // Time-based replanning trigger
       else if (t_cur > replan_thresh_)
       {
         changeFSMExecState(REPLAN_TRAJ, "FSM");
       }
-
       break;
     }
 
     case EMERGENCY_STOP:
     {
-
-      if (flag_escape_emergency_) // Avoiding repeated calls
+      // Emergency stop - command drone to hover at current position
+      if (flag_escape_emergency_)
       {
         callEmergencyStop(odom_pos_);
       }
       else
       {
+        // Try to recover if fail-safe is enabled and velocity is low
         if (enable_fail_safe_ && odom_vel_.norm() < 0.1)
           changeFSMExecState(GEN_NEW_TRAJ, "FSM");
       }
-
       flag_escape_emergency_ = false;
       break;
     }
     }
 
+    // Publish debug data
     data_disp_.header.stamp = ros::Time::now();
     data_disp_pub_.publish(data_disp_);
 
   force_return:;
-    exec_timer_.start();
+    exec_timer_.start();  // Resume timer
   }
 
   bool EGOReplanFSM::planFromGlobalTraj(const int trial_times /*=1*/) //zx-todo
@@ -674,16 +706,24 @@ namespace ego_planner
     return true;
   }
 
+  /**
+   * @brief Safety check callback for collision detection
+   * 
+   * Periodically checks if the current trajectory will collide with obstacles
+   * or other drones. Triggers emergency stop or replanning if collision is detected.
+   * 
+   * @param e Timer event (unused)
+   */
   void EGOReplanFSM::checkCollisionCallback(const ros::TimerEvent &e)
   {
-
     LocalTrajData *info = &planner_manager_->local_data_;
     auto map = planner_manager_->grid_map_;
 
+    // Skip check if waiting for target or no trajectory exists
     if (exec_state_ == WAIT_TARGET || info->start_time_.toSec() < 1e-5)
       return;
 
-    /* ---------- check lost of depth ---------- */
+    /* Check for depth sensor timeout - critical safety issue */
     if (map->getOdomDepthTimeout())
     {
       ROS_ERROR("Depth Lost! EMERGENCY_STOP");
@@ -691,21 +731,27 @@ namespace ego_planner
       changeFSMExecState(EMERGENCY_STOP, "SAFETY");
     }
 
-    /* ---------- check trajectory ---------- */
-    constexpr double time_step = 0.01;
+    /* Check trajectory for potential collisions */
+    constexpr double time_step = 0.01;  // Check every 10ms along trajectory
     double t_cur = (ros::Time::now() - info->start_time_).toSec();
     Eigen::Vector3d p_cur = info->position_traj_.evaluateDeBoorT(t_cur);
     const double CLEARANCE = 1.0 * planner_manager_->getSwarmClearance();
     double t_cur_global = ros::Time::now().toSec();
     double t_2_3 = info->duration_ * 2 / 3;
+    
+    // Check trajectory points from current time to 2/3 of trajectory
     for (double t = t_cur; t < info->duration_; t += time_step)
     {
-      if (t_cur < t_2_3 && t >= t_2_3) // If t_cur < t_2_3, only the first 2/3 partition of the trajectory is considered valid and will get checked.
+      // Only check first 2/3 of trajectory if we're still early
+      if (t_cur < t_2_3 && t >= t_2_3)
         break;
 
       bool occ = false;
+      
+      // Check collision with static obstacles
       occ |= map->getInflateOccupancy(info->position_traj_.evaluateDeBoorT(t));
 
+      // Check collision with other drones in swarm
       for (size_t id = 0; id < planner_manager_->swarm_trajs_buf_.size(); id++)
       {
         if ((planner_manager_->swarm_trajs_buf_.at(id).drone_id != (int)id) || (planner_manager_->swarm_trajs_buf_.at(id).drone_id == planner_manager_->pp_.drone_id))
@@ -724,10 +770,11 @@ namespace ego_planner
         }
       }
 
+      // Handle collision detection
       if (occ)
       {
-
-        if (planFromCurrentTraj()) // Make a chance
+        // Try to replan first
+        if (planFromCurrentTraj())
         {
           changeFSMExecState(EXEC_TRAJ, "SAFETY");
           publishSwarmTrajs(false);
@@ -735,14 +782,15 @@ namespace ego_planner
         }
         else
         {
-          if (t - t_cur < emergency_time_) // 0.8s of emergency time
+          // Check if collision is imminent (within emergency time)
+          if (t - t_cur < emergency_time_)
           {
             ROS_WARN("Suddenly discovered obstacles. emergency stop! time=%f", t - t_cur);
             changeFSMExecState(EMERGENCY_STOP, "SAFETY");
           }
           else
           {
-            //ROS_WARN("current traj in collision, replan.");
+            // Not immediate danger, try replanning
             changeFSMExecState(REPLAN_TRAJ, "SAFETY");
           }
           return;
